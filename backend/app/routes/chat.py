@@ -1,53 +1,70 @@
-from typing import Any
+from __future__ import annotations
+
+import uuid
 
 from fastapi import APIRouter, HTTPException
 
 from app.db import db
+from app.models import ChatRequest, ChatResponse
 from app.services.embeddings import embed_text
 from app.services.llm import generate_response
+from app.services.search import search_web
 from app.services.vectorstore import get_vector_store
 
 router = APIRouter(tags=["chat"])
 
 
-@router.post("/chat")
-def chat(request: Any) -> Any:
-    message = request.get("message") if isinstance(request, dict) else request.message
-    session_id = request.get("session_id") if isinstance(request, dict) else request.session_id
-
-    if not message or not message.strip():
+@router.post("/chat", response_model=ChatResponse)
+def chat(request: ChatRequest) -> ChatResponse:
+    if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # simple pipeline: embed -> (optional) upsert and query -> call llm with context
-    vec = embed_text(message)
+    session_id = request.session_id or str(uuid.uuid4())
 
-    # upsert to vector store (best-effort)
-    vs = get_vector_store()
-    try:
-        vs.upsert([session_id or "tmp-1"], [vec], metadata=[{"text": message}])
-    except Exception:
-        pass
+    # Search & retrieval step (best-effort, safe fallback)
+    search_results = search_web(request.message, top_k=3)
+    context_text = "\n".join(
+        f"{item['title']}: {item['snippet']} ({item['url']})" for item in search_results
+    )
+    vector = embed_text(request.message)
 
-    # query similar (best-effort)
-    sources = []
+    # Best effort vector store write/query
     try:
-        qres = vs.query(vec, top_k=3) if vs else []
-        # collect URLs if available in metadata
-        if getattr(qres, "matches", None):
-            for m in qres.matches:
-                meta = getattr(m, "metadata", None)
+        vector_store = get_vector_store()
+        vector_store.upsert([session_id], [vector], metadata=[{"text": request.message, "session_id": session_id}])
+        query_result = vector_store.query(vector, top_k=3)
+        if query_result:
+            for item in query_result.get("matches", []):
+                meta = item.get("metadata")
                 if meta and meta.get("url"):
-                    sources.append(meta.get("url"))
+                    search_results.append({
+                        "title": meta.get("title", "Related result"),
+                        "url": meta.get("url"),
+                        "snippet": meta.get("snippet", ""),
+                    })
     except Exception:
-        qres = None
+        query_result = []
 
-    response_text = generate_response(message)
+    system_prompt = (
+        "You are an AI coding assistant. Use the provided context to answer accurately. "
+        "If the context is weak or missing, say so clearly and keep the answer concise."
+    )
+
+    response_text = generate_response(
+        prompt=f"User question: {request.message}\n\nContext:\n{context_text}",
+        system_prompt=system_prompt,
+    )
 
     payload = {
-        "session_id": session_id or "",
-        "last_message": message,
+        "session_id": session_id,
+        "last_message": request.message,
         "last_response": response_text,
+        "sources": [item.get("url", "") for item in search_results if item.get("url")],
     }
-    db.save_session(session_id or "", payload)
+    db.save_session(session_id, payload)
 
-    return {"response": response_text, "session_id": session_id or "", "sources": sources}
+    return ChatResponse(
+        response=response_text,
+        session_id=session_id,
+        sources=[item.get("url", "") for item in search_results if item.get("url")],
+    )
