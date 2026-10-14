@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     pinecone_api_key: str = ""
     pinecone_env: str = ""
     pinecone_index: str = "ai-coder-agent"
+    database_url: str = "sqlite:///./data.db"
 
     model_config = SettingsConfigDict(
         env_file=".env",
